@@ -5,6 +5,7 @@ Simple and fast template engine for Go.
 
 Fasttemplate performs only a single task - it substitutes template placeholders
 with user-defined values. At high speed :)
+Now supporting conditional branches in templates.
 
 Take a look at [quicktemplate](https://github.com/valyala/quicktemplate) if you  need fast yet powerful html template engine.
 
@@ -58,6 +59,59 @@ Usage
 	// http://google.com/?q=hello%3Dworld&foo=foobarfoobar
 ```
 
+
+Conditions
+==========
+
+Use `if`, `else` and `end` to include parts of a template depending on values
+in the substitution map:
+
+```go
+	template := "Hello, {{if registered}}{{name}}{{else}}guest{{end}}!"
+	t := fasttemplate.New(template, "{{", "}}")
+	s := t.ExecuteString(map[string]interface{}{
+		"registered": true,
+		"name":       "John",
+	})
+	fmt.Printf("%s", s)
+
+	// Output:
+	// Hello, John!
+```
+
+Conditions can be nested and support `==`, `!=`, `<`, `>`, `<=`, `>=`, `!`, `&&`, `||` and
+parentheses, with Go operator precedence. For example:
+```
+{{if enabled && (count >= 2 || admin)}}Hello {{name}}{{else}}Hello guest{{end}}
+```
+
+False values:
+* Missing or nil values,
+* empty strings or byte slices,
+* boolean `false`
+All other values (including zero and the string `"false"`) are true.
+Only tags in the selected branch will execute their TagFunc value.
+
+
+Conditions may contain variable names, quoted strings, booleans and decimal
+numbers. Values aren't converted between types, so `"1" == 1` is false.
+Arithmetic and function calls aren't supported.
+
+Conditions are evaluated by `Execute`, `ExecuteStd`, `ExecuteString` and
+`ExecuteStringStd`. The `ExecuteFunc` variants treat `if`, `else` and `end` as
+ordinary tags and pass them to the callback.
+
+Below are benchmark results for reusable (`Frozen`) and one-shot templates,
+with and without a true condition:
+
+```
+$ go test -run '^$' -bench '^BenchmarkConditioningOverhead$/(Frozen|OneShot)/(CurrentNoCondition|ConditionTrue)$' -benchmem
+BenchmarkConditioningOverhead/Frozen/CurrentNoCondition-16     7045305    168.9 ns/op    0 B/op    0 allocs/op
+BenchmarkConditioningOverhead/Frozen/ConditionTrue-16          6184298    192.8 ns/op    0 B/op    0 allocs/op
+BenchmarkConditioningOverhead/OneShot/CurrentNoCondition-16    3613738    334.5 ns/op    0 B/op    0 allocs/op
+BenchmarkConditioningOverhead/OneShot/ConditionTrue-16         2563436    471.4 ns/op    0 B/op    0 allocs/op
+PASS
+```
 
 Advanced usage
 ==============

@@ -4,6 +4,9 @@
 // and strings.Replacer.
 //
 // Fasttemplate ideally fits for fast and simple placeholders' substitutions.
+// Templates may also contain conditional blocks using if, else and end tags.
+// Conditions are evaluated when template values are provided in a map.
+// ExecuteFunc treats every tag as a placeholder and passes it to the callback.
 package fasttemplate
 
 import (
@@ -21,6 +24,10 @@ import (
 // This function is optimized for constantly changing templates.
 // Use Template.ExecuteFunc for frozen templates.
 func ExecuteFunc(template, startTag, endTag string, w io.Writer, f TagFunc) (int64, error) {
+	return executeFunc(template, startTag, endTag, w, f, nil)
+}
+
+func executeFunc(template, startTag, endTag string, w io.Writer, f TagFunc, state *conditionState) (int64, error) {
 	s := unsafeString2Bytes(template)
 	a := unsafeString2Bytes(startTag)
 	b := unsafeString2Bytes(endTag)
@@ -33,48 +40,81 @@ func ExecuteFunc(template, startTag, endTag string, w io.Writer, f TagFunc) (int
 		if n < 0 {
 			break
 		}
-		ni, err = w.Write(s[:n])
-		nn += int64(ni)
-		if err != nil {
-			return nn, err
+		if state == nil || state.active {
+			ni, err = w.Write(s[:n])
+			nn += int64(ni)
+			if err != nil {
+				return nn, err
+			}
 		}
 
 		s = s[n+len(a):]
 		n = bytes.Index(s, b)
 		if n < 0 {
 			// cannot find end tag - just write it to the output.
-			ni, _ = w.Write(a)
-			nn += int64(ni)
+			if state == nil || state.active {
+				ni, err = w.Write(a)
+				nn += int64(ni)
+				if err != nil {
+					return nn, err
+				}
+			}
 			break
 		}
 
-		ni, err = f(w, unsafeBytes2String(s[:n]))
+		tag := unsafeBytes2String(s[:n])
+		s = s[n+len(b):]
+		if state != nil {
+			if mayBeControlTag(tag) {
+				handled, err := state.tag(tag)
+				if err != nil {
+					return nn, err
+				}
+				if handled {
+					continue
+				}
+			}
+			if !state.active {
+				continue
+			}
+		}
+		ni, err = f(w, tag)
 		nn += int64(ni)
 		if err != nil {
 			return nn, err
 		}
-		s = s[n+len(b):]
 	}
-	ni, err = w.Write(s)
-	nn += int64(ni)
-
-	return nn, err
+	if state == nil || state.active {
+		ni, err = w.Write(s)
+		nn += int64(ni)
+		if err != nil {
+			return nn, err
+		}
+	}
+	if state != nil && state.depth != 0 {
+		return nn, fmt.Errorf("missing end tag")
+	}
+	return nn, nil
 }
 
 // Execute substitutes template tags (placeholders) with the corresponding
 // values from the map m and writes the result to the given writer w.
+// The if, else, and end tags select which parts of the template to write,
+// using condition values from m.
 //
 // Substitution map m may contain values with the following types:
 //   * []byte - the fastest value type
 //   * string - convenient value type
 //   * TagFunc - flexible value type
 //
-// Returns the number of bytes written to w.
+// Returns the number of bytes written to w and any write or condition syntax
+// error. Output written before an error is included in the byte count.
 //
 // This function is optimized for constantly changing templates.
 // Use Template.Execute for frozen templates.
 func Execute(template, startTag, endTag string, w io.Writer, m map[string]interface{}) (int64, error) {
-	return ExecuteFunc(template, startTag, endTag, w, func(w io.Writer, tag string) (int, error) { return stdTagFunc(w, tag, m) })
+	state := conditionState{m: m, active: true}
+	return executeFunc(template, startTag, endTag, w, func(w io.Writer, tag string) (int, error) { return stdTagFunc(w, tag, m) }, &state)
 }
 
 // ExecuteStd works the same way as Execute, but keeps the unknown placeholders.
@@ -85,12 +125,14 @@ func Execute(template, startTag, endTag string, w io.Writer, m map[string]interf
 //   * string - convenient value type
 //   * TagFunc - flexible value type
 //
-// Returns the number of bytes written to w.
+// Returns the number of bytes written to w and any write or condition syntax
+// error. Output written before an error is included in the byte count.
 //
 // This function is optimized for constantly changing templates.
 // Use Template.ExecuteStd for frozen templates.
 func ExecuteStd(template, startTag, endTag string, w io.Writer, m map[string]interface{}) (int64, error) {
-	return ExecuteFunc(template, startTag, endTag, w, func(w io.Writer, tag string) (int, error) { return keepUnknownTagFunc(w, startTag, endTag, tag, m) })
+	state := conditionState{m: m, active: true}
+	return executeFunc(template, startTag, endTag, w, func(w io.Writer, tag string) (int, error) { return keepUnknownTagFunc(w, startTag, endTag, tag, m) }, &state)
 }
 
 // ExecuteFuncString calls f on each template tag (placeholder) occurrence
@@ -101,7 +143,11 @@ func ExecuteStd(template, startTag, endTag string, w io.Writer, m map[string]int
 // This function is optimized for constantly changing templates.
 // Use Template.ExecuteFuncString for frozen templates.
 func ExecuteFuncString(template, startTag, endTag string, f TagFunc) string {
-	s, err := ExecuteFuncStringWithErr(template, startTag, endTag, f)
+	return executeFuncString(template, startTag, endTag, f, nil)
+}
+
+func executeFuncString(template, startTag, endTag string, f TagFunc, state *conditionState) string {
+	s, err := executeFuncStringWithErr(template, startTag, endTag, f, state)
 	if err != nil {
 		panic(fmt.Sprintf("unexpected error: %s", err))
 	}
@@ -112,12 +158,16 @@ func ExecuteFuncString(template, startTag, endTag string, f TagFunc) string {
 // but when f returns an error, ExecuteFuncStringWithErr won't panic like ExecuteFuncString
 // it just returns an empty string and the error f returned
 func ExecuteFuncStringWithErr(template, startTag, endTag string, f TagFunc) (string, error) {
+	return executeFuncStringWithErr(template, startTag, endTag, f, nil)
+}
+
+func executeFuncStringWithErr(template, startTag, endTag string, f TagFunc, state *conditionState) (string, error) {
 	if n := bytes.Index(unsafeString2Bytes(template), unsafeString2Bytes(startTag)); n < 0 {
 		return template, nil
 	}
 
 	bb := byteBufferPool.Get()
-	if _, err := ExecuteFunc(template, startTag, endTag, bb, f); err != nil {
+	if _, err := executeFunc(template, startTag, endTag, bb, f, state); err != nil {
 		bb.Reset()
 		byteBufferPool.Put(bb)
 		return "", err
@@ -141,7 +191,8 @@ var byteBufferPool bytebufferpool.Pool
 // This function is optimized for constantly changing templates.
 // Use Template.ExecuteString for frozen templates.
 func ExecuteString(template, startTag, endTag string, m map[string]interface{}) string {
-	return ExecuteFuncString(template, startTag, endTag, func(w io.Writer, tag string) (int, error) { return stdTagFunc(w, tag, m) })
+	state := conditionState{m: m, active: true}
+	return executeFuncString(template, startTag, endTag, func(w io.Writer, tag string) (int, error) { return stdTagFunc(w, tag, m) }, &state)
 }
 
 // ExecuteStringStd works the same way as ExecuteString, but keeps the unknown placeholders.
@@ -155,7 +206,8 @@ func ExecuteString(template, startTag, endTag string, m map[string]interface{}) 
 // This function is optimized for constantly changing templates.
 // Use Template.ExecuteStringStd for frozen templates.
 func ExecuteStringStd(template, startTag, endTag string, m map[string]interface{}) string {
-	return ExecuteFuncString(template, startTag, endTag, func(w io.Writer, tag string) (int, error) { return keepUnknownTagFunc(w, startTag, endTag, tag, m) })
+	state := conditionState{m: m, active: true}
+	return executeFuncString(template, startTag, endTag, func(w io.Writer, tag string) (int, error) { return keepUnknownTagFunc(w, startTag, endTag, tag, m) }, &state)
 }
 
 // Template implements simple template engine, which can be used for fast
@@ -165,6 +217,7 @@ type Template struct {
 	startTag string
 	endTag   string
 
+	conditions     []conditionTag
 	texts          [][]byte
 	tags           []string
 	byteBufferPool bytebufferpool.Pool
@@ -187,7 +240,8 @@ func New(template, startTag, endTag string) *Template {
 }
 
 // NewTemplate parses the given template using the given startTag and endTag
-// as tag start and tag end.
+// as tag start and tag end. It validates the reserved if, else, and end tags,
+// regardless of the execution method.
 //
 // The returned template can be executed by concurrently running goroutines
 // using Execute* methods.
@@ -222,6 +276,7 @@ func (t *Template) Reset(template, startTag, endTag string) error {
 	t.endTag = endTag
 	t.texts = t.texts[:0]
 	t.tags = t.tags[:0]
+	t.conditions = nil
 
 	if len(startTag) == 0 {
 		panic("startTag cannot be empty")
@@ -234,6 +289,8 @@ func (t *Template) Reset(template, startTag, endTag string) error {
 	a := unsafeString2Bytes(startTag)
 	b := unsafeString2Bytes(endTag)
 
+	var frames [16]int
+	stack := frames[:0]
 	tagsCount := bytes.Count(s, a)
 	if tagsCount == 0 {
 		return nil
@@ -261,9 +318,17 @@ func (t *Template) Reset(template, startTag, endTag string) error {
 		}
 
 		t.tags = append(t.tags, unsafeBytes2String(s[:n]))
+		var err error
+		stack, err = t.compileConditionTag(len(t.tags)-1, tagsCount, stack)
+		if err != nil {
+			return err
+		}
 		s = s[n+len(b):]
 	}
 
+	if len(stack) != 0 {
+		return fmt.Errorf("missing end tag")
+	}
 	return nil
 }
 
@@ -274,6 +339,10 @@ func (t *Template) Reset(template, startTag, endTag string) error {
 // This function is optimized for frozen templates.
 // Use ExecuteFunc for constantly changing templates.
 func (t *Template) ExecuteFunc(w io.Writer, f TagFunc) (int64, error) {
+	return t.executeFunc(w, f, nil, nil)
+}
+
+func (t *Template) executeFunc(w io.Writer, f TagFunc, m map[string]interface{}, conditions []conditionTag) (int64, error) {
 	var nn int64
 
 	n := len(t.texts) - 1
@@ -289,6 +358,15 @@ func (t *Template) ExecuteFunc(w io.Writer, f TagFunc) (int64, error) {
 			return nn, err
 		}
 
+		if conditions != nil {
+			c := &conditions[i]
+			if c.jump != 0 {
+				if c.expr == nil || !c.expr.eval(m).truth() {
+					i = c.jump - 1
+				}
+				continue
+			}
+		}
 		ni, err = f(w, t.tags[i])
 		nn += int64(ni)
 		if err != nil {
@@ -310,7 +388,7 @@ func (t *Template) ExecuteFunc(w io.Writer, f TagFunc) (int64, error) {
 //
 // Returns the number of bytes written to w.
 func (t *Template) Execute(w io.Writer, m map[string]interface{}) (int64, error) {
-	return t.ExecuteFunc(w, func(w io.Writer, tag string) (int, error) { return stdTagFunc(w, tag, m) })
+	return t.executeFunc(w, func(w io.Writer, tag string) (int, error) { return stdTagFunc(w, tag, m) }, m, t.conditions)
 }
 
 // ExecuteStd works the same way as Execute, but keeps the unknown placeholders.
@@ -323,7 +401,7 @@ func (t *Template) Execute(w io.Writer, m map[string]interface{}) (int64, error)
 //
 // Returns the number of bytes written to w.
 func (t *Template) ExecuteStd(w io.Writer, m map[string]interface{}) (int64, error) {
-	return t.ExecuteFunc(w, func(w io.Writer, tag string) (int, error) { return keepUnknownTagFunc(w, t.startTag, t.endTag, tag, m) })
+	return t.executeFunc(w, func(w io.Writer, tag string) (int, error) { return keepUnknownTagFunc(w, t.startTag, t.endTag, tag, m) }, m, t.conditions)
 }
 
 // ExecuteFuncString calls f on each template tag (placeholder) occurrence
@@ -334,7 +412,11 @@ func (t *Template) ExecuteStd(w io.Writer, m map[string]interface{}) (int64, err
 // This function is optimized for frozen templates.
 // Use ExecuteFuncString for constantly changing templates.
 func (t *Template) ExecuteFuncString(f TagFunc) string {
-	s, err := t.ExecuteFuncStringWithErr(f)
+	return t.executeFuncString(f, nil, nil)
+}
+
+func (t *Template) executeFuncString(f TagFunc, m map[string]interface{}, conditions []conditionTag) string {
+	s, err := t.executeFuncStringWithErr(f, m, conditions)
 	if err != nil {
 		panic(fmt.Sprintf("unexpected error: %s", err))
 	}
@@ -349,8 +431,12 @@ func (t *Template) ExecuteFuncString(f TagFunc) string {
 // This function is optimized for frozen templates.
 // Use ExecuteFuncString for constantly changing templates.
 func (t *Template) ExecuteFuncStringWithErr(f TagFunc) (string, error) {
+	return t.executeFuncStringWithErr(f, nil, nil)
+}
+
+func (t *Template) executeFuncStringWithErr(f TagFunc, m map[string]interface{}, conditions []conditionTag) (string, error) {
 	bb := t.byteBufferPool.Get()
-	if _, err := t.ExecuteFunc(bb, f); err != nil {
+	if _, err := t.executeFunc(bb, f, m, conditions); err != nil {
 		bb.Reset()
 		t.byteBufferPool.Put(bb)
 		return "", err
@@ -372,7 +458,7 @@ func (t *Template) ExecuteFuncStringWithErr(f TagFunc) (string, error) {
 // This function is optimized for frozen templates.
 // Use ExecuteString for constantly changing templates.
 func (t *Template) ExecuteString(m map[string]interface{}) string {
-	return t.ExecuteFuncString(func(w io.Writer, tag string) (int, error) { return stdTagFunc(w, tag, m) })
+	return t.executeFuncString(func(w io.Writer, tag string) (int, error) { return stdTagFunc(w, tag, m) }, m, t.conditions)
 }
 
 // ExecuteStringStd works the same way as ExecuteString, but keeps the unknown placeholders.
@@ -386,7 +472,7 @@ func (t *Template) ExecuteString(m map[string]interface{}) string {
 // This function is optimized for frozen templates.
 // Use ExecuteStringStd for constantly changing templates.
 func (t *Template) ExecuteStringStd(m map[string]interface{}) string {
-	return t.ExecuteFuncString(func(w io.Writer, tag string) (int, error) { return keepUnknownTagFunc(w, t.startTag, t.endTag, tag, m) })
+	return t.executeFuncString(func(w io.Writer, tag string) (int, error) { return keepUnknownTagFunc(w, t.startTag, t.endTag, tag, m) }, m, t.conditions)
 }
 
 func stdTagFunc(w io.Writer, tag string, m map[string]interface{}) (int, error) {
